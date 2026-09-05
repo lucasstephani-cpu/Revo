@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string name="app_name">Revo</string>
+
+    <string name="main_title">Revo</string>
+    <string name="main_explanation">Revo draws a ring of soft dots around the edge of your screen that drift with the motion of the vehicle you\'re in. Your eyes get a moving cue that agrees with what your inner ear feels, which is what actually causes motion sickness in the first place - keep it running low in your peripheral vision while you read or scroll.</string>
+
+    <string name="main_permission_explanation">Revo needs permission to draw over other apps - that\'s the whole feature, since the dots have to sit on top of whatever you\'re using.</string>
+    <string name="main_button_grant_permission">Grant overlay permission</string>
+
+    <string name="main_status_permission_missing">Overlay permission not granted yet</string>
+    <string name="main_status_active">Active</string>
+    <string name="main_status_inactive">Off</string>
+
+    <string name="main_button_enable">Turn on</string>
+    <string name="main_button_disable">Turn off</string>
+
+    <string name="main_label_sensitivity">Sensitivity</string>
+    <string name="main_label_opacity">Dot opacity</string>
+    <string name="main_label_dot_count">Dot count</string>
+
+    <string name="notification_channel_name">Revo overlay</string>
+    <string name="notification_title">Revo is running</string>
+    <string name="notification_text">Tap to open Revo and turn it off</string>
+
+</resources>
