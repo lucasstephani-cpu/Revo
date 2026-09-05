@@ -90,8 +90,8 @@ class OverlayService : Service() {
 
     private fun startSensors() {
         val sensitivity = Prefs.sensibilidade(this) / 100f
-        motionFusion = MotionFusion(sensorManager) { dx, dy, spin ->
-            overlayView?.updateMotion(dx, dy, spin)
+        motionFusion = MotionFusion(sensorManager) { dx, dy ->
+            overlayView?.updateMotion(dx, dy)
         }.apply {
             this.sensitivity = sensitivity
             start()

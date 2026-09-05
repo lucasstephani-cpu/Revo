@@ -19,7 +19,7 @@ object Prefs {
 
     const val PADRAO_SENSIBILIDADE = 50
     const val PADRAO_OPACIDADE = 55
-    const val PADRAO_QUANTIDADE_PONTOS = 28
+    const val PADRAO_QUANTIDADE_PONTOS = 90
 
     fun arquivo(context: Context): SharedPreferences =
         context.getSharedPreferences(NOME_ARQUIVO, Context.MODE_PRIVATE)

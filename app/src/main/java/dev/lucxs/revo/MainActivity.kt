@@ -50,7 +50,7 @@ class MainActivity : Activity() {
         sensibilidadeBarra.setOnSeekBarChangeListener(onChange { Prefs.setSensibilidade(this, it) })
         opacidadeBarra.setOnSeekBarChangeListener(onChange { Prefs.setOpacidade(this, it) })
         quantidadeBarra.setOnSeekBarChangeListener(
-            onChange { Prefs.setQuantidadePontos(this, it.coerceAtLeast(6)) },
+            onChange { Prefs.setQuantidadePontos(this, it.coerceAtLeast(12)) },
         )
     }
 

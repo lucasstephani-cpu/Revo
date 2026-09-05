@@ -7,42 +7,45 @@ import android.hardware.SensorManager
 import kotlin.math.sqrt
 
 /**
- * Turns raw accelerometer/gyroscope samples into a small, bounded "motion
- * cue": (dx, dy) is how far the dot ring should drift, spin is how far it
- * should rotate. Both are meant to feel like the ring is a fixed part of
- * the outside world reacting to the vehicle's braking/accelerating/turning
- * - not a real position, and not real yaw.
- *
- * Why not just integrate acceleration into a position directly? Because
- * accelerometer noise integrates into unbounded drift within seconds. This
- * instead drives a damped spring: acceleration pushes a velocity, velocity
- * pushes a position, and both velocity and position are constantly pulled
- * back toward zero. The result tracks sustained acceleration (braking over
- * ~1-2s) while a one-off jolt or steady cruising settles back to center
- * instead of wandering off.
+ * Turns raw accelerometer samples into one signal: (dx, dy), the phone's
+ * own estimated displacement since the leak last let it settle. Everything
+ * downstream (MotionOverlayView) treats this as "how far the camera has
+ * moved" and draws each dot's on-screen position as the *negative* of
+ * this, scaled by 1/depth - the standard parallax relationship for a
+ * point that's actually fixed in space while the camera carrying it moves.
  *
  * Reference frame: TYPE_GRAVITY reports "up" in the phone's own axes (the
  * same convention as the accelerometer - a phone resting on a table reads
  * +9.8 on the axis pointing away from the table). Projecting linear
  * acceleration onto the plane perpendicular to that gravity vector isolates
  * the horizontal (real-world) push/pull from whatever angle the phone
- * happens to be held at, so the cue stays correct whether the user holds
- * the phone flat or tilts it back to read. The two axes of that plane are
- * rebuilt from gravity on every sample (see rightHat/forwardHat below), so
- * they also self-correct if the user's hand tilt changes.
+ * happens to be held at. The two axes of that plane (rightHat/forwardHat)
+ * are rebuilt from gravity on every sample, so they self-correct if the
+ * user's hand tilt changes.
  *
- * What this can't separate: a genuine, deliberate rotation of the phone in
- * the hand around the axis pointing at the user's face looks the same to
- * the gyroscope as the vehicle actually turning. There's no way around
- * this with only the phone's own sensors (a headset fixed to the head, like
- * the commercial devices this app is inspired by, doesn't have the
- * problem). The low-pass filtering below is tuned to mostly absorb quick
- * hand adjustments, since those are brief compared to how long a real
- * lane change or turn takes - but it's a real limitation, not a bug.
+ * On integrating acceleration twice: naive double integration of a real
+ * accelerometer drifts into nonsense within seconds, because there's no
+ * such thing as unbiased-forever acceleration data. Instead this leaks at
+ * two timescales: velocity leaks back toward zero with a ~4s time
+ * constant (so it tracks a real 1-3s brake/turn almost like true
+ * integration, since that's short next to 4s), and position leaks back
+ * with a slower ~12s constant on top of that (so a stopped vehicle, or a
+ * phone just sitting on a table, settles the dots back toward center
+ * within the following 10-20s instead of the field staying shifted
+ * forever). Both constants are first-pass estimates meant to be retuned
+ * after actually riding with this.
+ *
+ * Rotation is deliberately NOT compensated here. A phone's gyroscope can't
+ * tell "the user tilted the phone in their hand" apart from "the vehicle
+ * actually turned" - both look identical to the sensor. Folding that in
+ * would make the field visibly (and wrongly) swing every time someone
+ * just adjusts their grip. Left as a scoped future extension for once
+ * there's a way to disambiguate the two (e.g. only trusting gyro signal
+ * that's sustained and correlated with lateral accelerometer signal).
  */
 class MotionFusion(
     private val sensorManager: SensorManager,
-    private val onMotion: (dx: Float, dy: Float, spin: Float) -> Unit,
+    private val onMotion: (dx: Float, dy: Float) -> Unit,
 ) : SensorEventListener {
 
     /** 0..1, set from the "Sensitivity" slider. */
@@ -51,32 +54,25 @@ class MotionFusion(
     private val gravity = FloatArray(3)
     private var hasGravity = false
 
-    // Exponential-moving-average low-pass state for the horizontal
-    // acceleration cue, ~250ms time constant at typical sensor rates.
+    // Exponential-moving-average low-pass on the horizontal acceleration,
+    // ~250ms time constant at typical sensor rates - smooths sensor noise
+    // and quick hand jitter before it ever reaches the integrator, so the
+    // result reads as one smooth push rather than a buzz.
     private var lateralFiltered = 0f
     private var frontBackFiltered = 0f
     private val filterAlpha = 0.15f
 
-    // Damped-spring state for the ring's (x, y) drift.
     private var velX = 0f
     private var velY = 0f
     private var posX = 0f
     private var posY = 0f
-    private var lastAccelTimestampNs = 0L
-
-    // Damped-spring state for the ring's rotation (turning cue).
-    private var spinVel = 0f
-    private var spin = 0f
-    private var lastGyroTimestampNs = 0L
+    private var lastTimestampNs = 0L
 
     fun start() {
         sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
     }
@@ -93,20 +89,15 @@ class MotionFusion(
                 gravity[2] = event.values[2]
                 hasGravity = true
             }
-            Sensor.TYPE_LINEAR_ACCELERATION -> if (hasGravity) {
-                onLinearAcceleration(event)
-            }
-            Sensor.TYPE_GYROSCOPE -> if (hasGravity) {
-                onGyroscope(event)
-            }
+            Sensor.TYPE_LINEAR_ACCELERATION -> if (hasGravity) onLinearAcceleration(event)
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     private fun onLinearAcceleration(event: SensorEvent) {
-        val dt = deltaSeconds(lastAccelTimestampNs, event.timestamp)
-        lastAccelTimestampNs = event.timestamp
+        val dt = deltaSeconds(lastTimestampNs, event.timestamp)
+        lastTimestampNs = event.timestamp
         if (dt <= 0f) return
 
         val upHat = normalized(gravity) ?: return
@@ -120,53 +111,28 @@ class MotionFusion(
         frontBackFiltered += (frontBack - frontBackFiltered) * filterAlpha
 
         // sensitivity 0..1 -> drive gain; higher sensitivity = the same
-        // real-world acceleration pushes the ring further.
-        val driveGain = 6f + sensitivity * 18f
-        val damping = 4f
-        val restoreTau = 0.6f
+        // real-world acceleration builds up more estimated displacement.
+        val driveGain = 0.4f + sensitivity * 1.2f
 
-        velX += (lateralFiltered * driveGain - damping * velX) * dt
-        velY += (frontBackFiltered * driveGain - damping * velY) * dt
-        posX += velX * dt
-        posY += velY * dt
-        posX -= posX * (dt / restoreTau)
-        posY -= posY * (dt / restoreTau)
+        velX += (lateralFiltered * driveGain - velX / VELOCITY_LEAK_TAU_S) * dt
+        velY += (frontBackFiltered * driveGain - velY / VELOCITY_LEAK_TAU_S) * dt
+        posX += velX * dt - posX * (dt / POSITION_LEAK_TAU_S)
+        posY += velY * dt - posY * (dt / POSITION_LEAK_TAU_S)
 
-        posX = posX.coerceIn(-MAX_OFFSET, MAX_OFFSET)
-        posY = posY.coerceIn(-MAX_OFFSET, MAX_OFFSET)
+        // Not the mechanism that returns the field to center (that's
+        // POSITION_LEAK_TAU_S) - just a backstop against a pathological
+        // sensor spike (phone dropped, violent shake) blowing this up.
+        posX = posX.coerceIn(-SAFETY_CLAMP_UNITS, SAFETY_CLAMP_UNITS)
+        posY = posY.coerceIn(-SAFETY_CLAMP_UNITS, SAFETY_CLAMP_UNITS)
 
-        onMotion(posX, posY, spin)
-    }
-
-    private fun onGyroscope(event: SensorEvent) {
-        val dt = deltaSeconds(lastGyroTimestampNs, event.timestamp)
-        lastGyroTimestampNs = event.timestamp
-        if (dt <= 0f) return
-
-        val upHat = normalized(gravity) ?: return
-        // Component of angular velocity about the "up" axis = yaw rate in
-        // the phone's own horizontal frame, i.e. how fast it's turning flat,
-        // which is what a vehicle turning left/right looks like.
-        val yawRate = dot(event.values, upHat)
-
-        val driveGain = 0.6f + sensitivity * 1.2f
-        val damping = 3f
-        val restoreTau = 0.8f
-
-        spinVel += (yawRate * driveGain - damping * spinVel) * dt
-        spin += spinVel * dt
-        spin -= spin * (dt / restoreTau)
-        spin = spin.coerceIn(-MAX_SPIN_RADIANS, MAX_SPIN_RADIANS)
-
-        onMotion(posX, posY, spin)
+        onMotion(posX, posY)
     }
 
     private fun deltaSeconds(lastNs: Long, nowNs: Long): Float {
         if (lastNs == 0L) return 0f
-        val dt = (nowNs - lastNs) / 1_000_000_000f
         // Clamp so a paused/backgrounded sensor stream (or the very first
-        // sample) can't slam the spring with a huge synthetic dt.
-        return dt.coerceIn(0f, 0.1f)
+        // sample) can't slam the integrator with a huge synthetic dt.
+        return ((nowNs - lastNs) / 1_000_000_000f).coerceIn(0f, 0.1f)
     }
 
     private fun normalized(v: FloatArray): FloatArray? {
@@ -190,10 +156,8 @@ class MotionFusion(
         // gravity - see the class doc above.
         private val DEVICE_FORWARD_AXIS = floatArrayOf(0f, 0f, 1f)
 
-        // Arbitrary internal spring units (not pixels, not m/s^2) - the
-        // overlay view maps the final posX/posY into an actual pixel
-        // offset. This just bounds how far the spring itself can wind up.
-        private const val MAX_OFFSET = 40f
-        private const val MAX_SPIN_RADIANS = 0.35f
+        private const val VELOCITY_LEAK_TAU_S = 4f
+        private const val POSITION_LEAK_TAU_S = 12f
+        private const val SAFETY_CLAMP_UNITS = 30f
     }
 }

@@ -5,33 +5,35 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.view.View
-import kotlin.math.cos
-import kotlin.math.min
-import kotlin.math.sin
+import kotlin.random.Random
 
 /**
- * Draws two concentric rings of dots hugging the screen edge. Both rings
- * share the same motion cue from MotionFusion, but the outer ring moves
- * more than the inner one - the same parallax trick as looking out a car
- * window, where the near foreground slides past faster than the distant
- * background. That difference is what reads as "depth" instead of the
- * whole screen just wobbling uniformly.
+ * A full-screen field of dots, each with a fixed random depth. Depth
+ * controls how far a dot swings for a given camera motion (near = more,
+ * far = less - see MotionFusion's class doc for why it's the *negative*
+ * of the phone's own estimated displacement), plus its size and opacity,
+ * so the field reads as points scattered through actual depth rather than
+ * a flat image sliding around - the same cue as looking out a car window.
  *
- * Dots sit only in a band near the edges (not scattered across the middle)
- * so they stay in peripheral vision and don't cover whatever the user is
- * actually reading.
+ * Dots wrap around the screen edges instead of sliding off permanently
+ * (like a scrolling starfield): the phone can keep drifting in one
+ * direction for as long as the vehicle keeps accelerating that way, but
+ * the field has to stay full of dots regardless.
  */
 class MotionOverlayView(context: Context) : View(context) {
 
+    private class Dot(val baseXFraction: Float, val baseYFraction: Float, val depth: Float)
+
+    private val density = context.resources.displayMetrics.density
+
+    private var dots: List<Dot> = emptyList()
     private var dotCount = Prefs.PADRAO_QUANTIDADE_PONTOS
     private var opacity = Prefs.PADRAO_OPACIDADE / 100f
 
-    private var offsetX = 0f
-    private var offsetY = 0f
-    private var spinRadians = 0f
+    private var phoneShiftX = 0f
+    private var phoneShiftY = 0f
 
-    private val paintInner = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-    private val paintOuter = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
 
     init {
         // The overlay's window is already touch-transparent (see
@@ -42,8 +44,8 @@ class MotionOverlayView(context: Context) : View(context) {
     }
 
     fun setDotCount(count: Int) {
-        dotCount = count.coerceIn(6, 48)
-        invalidate()
+        dotCount = count.coerceIn(MIN_DOTS, MAX_DOTS)
+        regenerateDots()
     }
 
     fun setOpacity(percent: Int) {
@@ -51,10 +53,29 @@ class MotionOverlayView(context: Context) : View(context) {
         invalidate()
     }
 
-    fun updateMotion(dx: Float, dy: Float, spin: Float) {
-        offsetX = dx
-        offsetY = dy
-        spinRadians = spin
+    fun updateMotion(dx: Float, dy: Float) {
+        phoneShiftX = dx
+        phoneShiftY = dy
+        invalidate()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        regenerateDots()
+    }
+
+    private fun regenerateDots() {
+        if (width <= 0 || height <= 0) return
+        // Fixed seed: regenerating (on a resize, or a dot-count change)
+        // keeps the same field instead of visibly reshuffling every dot.
+        val random = Random(SEED)
+        dots = List(dotCount) {
+            Dot(
+                baseXFraction = random.nextFloat(),
+                baseYFraction = random.nextFloat(),
+                depth = MIN_DEPTH + random.nextFloat() * (MAX_DEPTH - MIN_DEPTH),
+            )
+        }
         invalidate()
     }
 
@@ -62,63 +83,52 @@ class MotionOverlayView(context: Context) : View(context) {
         super.onDraw(canvas)
         val w = width.toFloat()
         val h = height.toFloat()
-        if (w <= 0f || h <= 0f) return
+        if (w <= 0f || h <= 0f || dots.isEmpty()) return
 
-        val cx = w / 2f
-        val cy = h / 2f
-        val inset = min(w, h) * 0.05f
-        val rx = cx - inset
-        val ry = cy - inset
+        val pxPerUnit = minOf(w, h) * WORLD_UNIT_TO_SCREEN_FRACTION
 
-        // MotionFusion's posX/posY are arbitrary spring units (see its own
-        // MAX_OFFSET comment); this is the one place that turns them into
-        // an actual, screen-size-relative pixel distance.
-        val maxPixelDrift = min(w, h) * 0.03f
-        val pxX = (offsetX / 40f) * maxPixelDrift
-        val pxY = (offsetY / 40f) * maxPixelDrift
+        for (dotSpec in dots) {
+            val shiftX = -phoneShiftX / dotSpec.depth * pxPerUnit
+            val shiftY = -phoneShiftY / dotSpec.depth * pxPerUnit
 
-        paintInner.alpha = (opacity * 255).toInt()
-        paintOuter.alpha = (opacity * 0.7f * 255).toInt()
+            val x = wrap(dotSpec.baseXFraction * w + shiftX, w)
+            val y = wrap(dotSpec.baseYFraction * h + shiftY, h)
 
-        drawRing(
-            canvas,
-            cx, cy, rx * 0.92f, ry * 0.92f,
-            driftScale = 0.6f, pxX = pxX, pxY = pxY,
-            radiusPx = min(w, h) * 0.006f,
-            paint = paintInner,
-        )
-        drawRing(
-            canvas,
-            cx, cy, rx, ry,
-            driftScale = 1.3f, pxX = pxX, pxY = pxY,
-            radiusPx = min(w, h) * 0.009f,
-            paint = paintOuter,
-        )
-    }
+            // depth in [MIN_DEPTH, MAX_DEPTH] makes this land in
+            // [1/MAX_DEPTH, 1/MIN_DEPTH] automatically - no extra clamping
+            // needed for the radius.
+            val depthScale = 1f / dotSpec.depth
+            val alphaScale = depthScale.coerceIn(MIN_ALPHA_SCALE, MAX_ALPHA_SCALE)
 
-    private fun drawRing(
-        canvas: Canvas,
-        cx: Float,
-        cy: Float,
-        rx: Float,
-        ry: Float,
-        driftScale: Float,
-        pxX: Float,
-        pxY: Float,
-        radiusPx: Float,
-        paint: Paint,
-    ) {
-        val driftedX = pxX * driftScale
-        val driftedY = pxY * driftScale
-        for (i in 0 until dotCount) {
-            val angle = (i.toFloat() / dotCount) * TWO_PI + spinRadians
-            val x = cx + rx * cos(angle) + driftedX
-            val y = cy + ry * sin(angle) + driftedY
-            canvas.drawCircle(x, y, radiusPx, paint)
+            paint.alpha = (opacity * alphaScale * 255).toInt().coerceIn(0, 255)
+            canvas.drawCircle(x, y, BASE_RADIUS_DP * density * depthScale, paint)
         }
     }
 
+    private fun wrap(value: Float, max: Float): Float {
+        val m = value % max
+        return if (m < 0f) m + max else m
+    }
+
     companion object {
-        private const val TWO_PI = (Math.PI * 2).toFloat()
+        private const val SEED = 1L
+
+        private const val MIN_DOTS = 12
+        private const val MAX_DOTS = 240
+
+        private const val MIN_DEPTH = 0.4f
+        private const val MAX_DEPTH = 2.5f
+        private const val MIN_ALPHA_SCALE = 0.35f
+        private const val MAX_ALPHA_SCALE = 1f
+
+        private const val BASE_RADIUS_DP = 2.2f
+
+        // 1.0 "world unit" of MotionFusion's leaky-integrated signal maps
+        // to this fraction of the screen's shorter side, for a depth=1
+        // (mid-distance) dot. Tuned so a typical few-seconds brake/turn
+        // sweeps a noticeable but not disorienting fraction of the screen
+        // - see MotionFusion's class doc for the leak time constants this
+        // multiplies against.
+        private const val WORLD_UNIT_TO_SCREEN_FRACTION = 0.04f
     }
 }
